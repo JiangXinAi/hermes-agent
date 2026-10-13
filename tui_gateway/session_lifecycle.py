@@ -350,16 +350,42 @@ def _teardown_popped_session(session: dict | None, *, end_reason: str = "tui_clo
     if session is None:
         return False
     run_thread = session.get("_run_thread")
-    if end_reason != "tui_shutdown" and run_thread is not None and run_thread is not threading.current_thread():
+    from hermes_cli.plugins_dispatch import join_execution_worker
+    workers = []
+    for scope in session.get("_execution_initial_scopes", ()):
+        for thread in scope.worker_objects:
+            if not any(previous is thread for previous in workers):
+                workers.append(thread)
+    if run_thread is not None and not any(thread is run_thread for thread in workers):
+        workers.append(run_thread)
+    import time
+    deadline = time.monotonic() + _TURN_SETTLE_BEFORE_CLOSE_SECONDS
+    lifecycle_failure = None
+    for scope in session.get("_execution_initial_scopes", ()):
         try:
-            if run_thread.is_alive():
-                run_thread.join(timeout=_TURN_SETTLE_BEFORE_CLOSE_SECONDS)
-            if run_thread.is_alive():
-                logger.warning(
-                    "session turn thread still alive after %.1fs teardown grace", _TURN_SETTLE_BEFORE_CLOSE_SECONDS)
-        except Exception:
-            logger.debug("failed waiting for session turn thread", exc_info=True)
-    _teardown_session(session, end_reason=end_reason)
+            scope.observe("scope_sealed")
+        except BaseException as error:
+            if lifecycle_failure is None:
+                lifecycle_failure = error
+    if end_reason != "tui_shutdown":
+        for thread in workers:
+            if thread is threading.current_thread():
+                continue  # Self-close never certifies the caller's own join.
+            try:
+                joined = join_execution_worker(thread, max(0.0, deadline - time.monotonic()))
+                if not joined and thread.is_alive():
+                    logger.warning("session worker still alive after teardown grace")
+            except BaseException as error:
+                if lifecycle_failure is None:
+                    lifecycle_failure = error
+    # Closing/timeout ACK does not remove persisted unknown membership. The
+    # original teardown must still run after an observation failure.
+    try:
+        _teardown_session(session, end_reason=end_reason)
+    finally:
+        if lifecycle_failure is not None:
+            raise lifecycle_failure
+
     return True
 
 

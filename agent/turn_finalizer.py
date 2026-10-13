@@ -482,6 +482,18 @@ def finalize_turn(
                 lifecycle_failure = error
     if retained_pools or hasattr(agent, "_tool_lifecycle_pools"):
         agent._tool_lifecycle_pools = retained_pools
+    from hermes_cli.plugins_dispatch import current_initial_execution_scope, join_execution_worker
+    initial = current_initial_execution_scope()
+    if initial is not None:
+        for thread in tuple(initial.worker_objects):
+            handle = getattr(thread, "_execution_lifecycle", None)
+            if handle is None or handle.resource_kind not in {"deadline", "background_review"}:
+                continue
+            try:
+                join_execution_worker(thread, timeout=max(0.0, join_deadline - time.monotonic()))
+            except BaseException as error:
+                if lifecycle_failure is None:
+                    lifecycle_failure = error
     try:
         from tools.process_registry import process_registry
         process_registry.reconcile_execution_lifecycle(

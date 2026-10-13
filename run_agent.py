@@ -786,8 +786,14 @@ class AIAgent(
         )
         from tools.thread_context import propagate_context_to_thread
 
+        from hermes_cli.plugins_dispatch import (reserve_execution_resource, current_initial_execution_scope,
+            execution_worker_target, retain_execution_worker)
+        from uuid import uuid4
+        handle = reserve_execution_resource("background_review", uuid4().hex,
+                                            parent=current_initial_execution_scope())
         review_run = prepare_background_review_run(self)
         if review_run is None:
+            handle.observe("not_started")
             return
         try:
             target, _prompt = spawn_background_review_thread(
@@ -804,8 +810,15 @@ class AIAgent(
 
             # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
             # right profile.
-            threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review").start()
-        except Exception:
+            thread = threading.Thread(target=execution_worker_target(handle,
+                propagate_context_to_thread(_target_with_requeue)), daemon=True, name="bg-review")
+            retain_execution_worker(handle, thread)
+            try:
+                thread.start()
+            except BaseException:
+                handle.observe("not_started")
+                raise
+        except BaseException:
             finish_background_review_run(self, review_run)
             raise
 

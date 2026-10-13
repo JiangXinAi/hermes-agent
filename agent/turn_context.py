@@ -476,6 +476,9 @@ def _bind_turn_identity(
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
+    from hermes_cli.plugins_dispatch import bind_execution_turn
+    bind_execution_turn({"session_id": str(agent.session_id or ""),
+                         "task_id": effective_task_id, "turn_id": turn_id})
     # Tripwire: warn when this turn starts before the previous turn-end persist
     # (concurrent turns interleave transcript writes). Cleared in _persist_session.
     from agent.agent_runtime_helpers import note_turn_start

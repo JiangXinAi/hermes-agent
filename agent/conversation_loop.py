@@ -1594,22 +1594,32 @@ def run_conversation(
     """
     from agent.turn_context import export_current_turn_boundary
 
-    result = _run_conversation_turn(
-        agent,
-        user_message,
-        system_message=system_message,
-        conversation_history=conversation_history,
-        task_id=task_id,
-        stream_callback=stream_callback,
-        persist_user_message=persist_user_message,
-        persist_user_timestamp=persist_user_timestamp,
-        persist_user_display_kind=persist_user_display_kind,
-        persist_user_display_metadata=persist_user_display_metadata,
-        persist_user_platform_id=persist_user_platform_id,
-        moa_config=moa_config,
-        turn_author=turn_author,
-    )
-    return export_current_turn_boundary(agent, result, user_message)
+    from hermes_cli.plugins_dispatch import current_execution_lifecycle, execution_lifecycle_scope
+    original = current_execution_lifecycle()
+    with execution_lifecycle_scope(original):
+        try:
+            result = _run_conversation_turn(
+                agent,
+                user_message,
+                system_message=system_message,
+                conversation_history=conversation_history,
+                task_id=task_id,
+                stream_callback=stream_callback,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_platform_id=persist_user_platform_id,
+                moa_config=moa_config,
+                turn_author=turn_author,
+            )
+            return export_current_turn_boundary(agent, result, user_message)
+        finally:
+            bound = current_execution_lifecycle()
+            if bound is not None and bound is not original and bound.resource_kind == "turn":
+                from threading import get_ident
+                bound.observe("invocation_exited", thread_ident=get_ident())
+
 
 
 __all__ = ["run_conversation"]

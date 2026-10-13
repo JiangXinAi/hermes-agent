@@ -23,6 +23,41 @@ from agent.turn_context import (
 from hermes_state import SessionDB
 
 
+@pytest.mark.parametrize("refuse", [False, True])
+def test_actual_turn_identity_is_bound_to_original_initial_ticket_before_use(monkeypatch, refuse):
+    from agent.turn_context import _bind_turn_identity
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from hermes_cli.plugins_dispatch import (ExecutionLifecycleError, current_execution_lifecycle,
+        execution_lifecycle_scope, initial_execution_scope, reserve_execution_resource)
+    manager, observations = PluginManager(), []
+    def callback(*, event):
+        if event["phase"] == "bind_turn":
+            observations.append(event)
+            if refuse:
+                raise ValueError("inert owner refuses original turn")
+        return {"admitted": True, "ticket": object()} if event["phase"] in {"reserve", "bind_turn"} else {"recorded": True}
+    PluginContext(PluginManifest(name="component-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    agent = _FakeAgent()
+    initial = initial_execution_scope("inert-runtime", {"session_key": agent.session_id})
+    worker = reserve_execution_resource("conversation_worker", "inert-conversation", parent=initial)
+    with execution_lifecycle_scope(worker):
+        if refuse:
+            with pytest.raises(ExecutionLifecycleError):
+                _bind_turn_identity(agent, None, None, None, None, None)
+        else:
+            task_id, turn_id = _bind_turn_identity(agent, None, None, None, None, None)
+            assert current_execution_lifecycle().parent is worker
+            assert (task_id, turn_id) == (agent._current_task_id, agent._current_turn_id)
+    bound = observations[0]
+    assert bound["parent_ticket"] is worker.ticket_for(callback)
+    assert bound["context"]["task_id"] == agent._current_task_id
+    assert bound["context"]["turn_id"] == agent._current_turn_id
+    assert bound["context"]["stored_session_id"] == agent.session_id
+    assert bound["context"]["runtime_session_id"] == "inert-runtime"
+
+
 class _FakeTodoStore:
     def has_items(self):
         return True

@@ -16,8 +16,29 @@ prompt path now calls, and its answer decides retry-vs-replay.
 from __future__ import annotations
 
 import threading
+import pytest
 
 from tui_gateway import server
+
+
+def test_initial_admission_refusal_precedes_original_agent_build_start(tmp_path, monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from hermes_cli.plugins_dispatch import ExecutionLifecycleError
+    manager, phases = PluginManager(), []
+    def callback(*, event):
+        phases.append((event["phase"], event["resource_kind"]))
+        raise ValueError("component initial admission refused")
+    PluginContext(PluginManifest(name="component-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    monkeypatch.setattr(server, "_make_agent", lambda *args, **kwargs: pytest.fail("refused build must not execute"))
+    session = {"session_key": "inert-stored", "agent_ready": threading.Event(), "history_lock": threading.Lock()}
+    with pytest.raises(ExecutionLifecycleError):
+        server._start_agent_build("inert-runtime", session)
+    assert phases == [("reserve", "initial")]
+    assert not session.get("agent_build_started")
+    assert "_agent_build_thread" not in session
+    assert not session["agent_ready"].is_set()
 
 
 def failed_session(tmp_path, sid: str) -> dict:

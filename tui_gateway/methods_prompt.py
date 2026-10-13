@@ -649,16 +649,35 @@ def _(rid, params: dict) -> dict:
             isolated_response["error"].get("message", "unknown error"))
     if (err := _persist_session_row_for_submit(rid, session)) is not None:
         return err
-    # A completed FAILED build must not wedge the session: rebuild, don't replay it.
-    if not _restart_completed_failed_agent_build(sid, session, session.get("agent_ready")):
-        _start_agent_build(sid, session)
-    run_thread = threading.Thread(
-        target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author),
-        daemon=True)
-    # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
-    session["_run_thread"] = run_thread
-    run_thread.start()
+    from hermes_cli.plugins_dispatch import (
+        initial_execution_scope, execution_lifecycle_scope, reserve_execution_resource,
+        execution_worker_target, retain_execution_worker,
+    )
+    try:
+        initial = initial_execution_scope(sid, session, fresh=True)
+        with execution_lifecycle_scope(initial):
+            # Original build remains deferred and uses its own original Thread.
+            if not _restart_completed_failed_agent_build(sid, session, session.get("agent_ready")):
+                _start_agent_build(sid, session)
+            from uuid import uuid4
+            handle = reserve_execution_resource("ready_wrapper", uuid4().hex)
+            run_thread = threading.Thread(target=execution_worker_target(handle, lambda: _run_after_agent_ready(
+                rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author)), daemon=True)
+            retain_execution_worker(handle, run_thread)
+            if initial.tracked and not any(scope is initial for scope in session.setdefault("_execution_initial_scopes", [])):
+                session["_execution_initial_scopes"].append(initial)
+            session["_run_thread"] = run_thread
+            try:
+                run_thread.start()
+            except BaseException:
+                handle.observe("not_started")
+                initial.observe("scope_sealed")
+                raise
+    except BaseException:
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        raise
     return _ok(rid, {"status": "streaming", **survivor_fields})
 
 

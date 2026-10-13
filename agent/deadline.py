@@ -309,10 +309,33 @@ def run_bounded_sync(
             box["value"] = ctx.run(fn)
         except BaseException as exc:  # re-raised in caller; must not vanish
             box["exc"] = exc
+
+    from hermes_cli.plugins_dispatch import (reserve_execution_resource, execution_worker_target,
+        retain_execution_worker, join_execution_worker, current_execution_lifecycle, current_initial_execution_scope)
+    from uuid import uuid4
+    parent = current_execution_lifecycle()
+    initial = current_initial_execution_scope()
+    # A bounded call can originate inside an admitted tool. Its original
+    # opaque parent remains that tool; session facts come from its ancestor.
+    handle = reserve_execution_resource("deadline", uuid4().hex, parent=parent,
+        context=initial.context if initial is not None else None)
+    original_target = execution_worker_target(handle, _worker)
+    def _thread_entry() -> None:
+        try:
+            original_target()
+        except BaseException as exc:
+            # Startup/finally refusals belong to this same original caller,
+            # even when the lifecycle owner prevents fn from being entered.
+            box["exc"] = exc
         finally:
             done.set()
-
-    threading.Thread(target=_worker, name=f"deadline-{label}", daemon=True).start()
+    thread = threading.Thread(target=_thread_entry, name=f"deadline-{label}", daemon=True)
+    retain_execution_worker(handle, thread)
+    try:
+        thread.start()
+    except BaseException:
+        handle.observe("not_started")
+        raise
     deadline = start + timeout_s
     while not done.is_set():
         remaining = deadline - time.monotonic()
@@ -332,6 +355,8 @@ def run_bounded_sync(
                 logger.debug("deadline on_timeout callback failed", exc_info=True)
         return _result(start, timeout_s, label, timed_out=True)
 
+    # done is an invocation outcome; it is not the original worker's join.
+    join_execution_worker(thread, timeout=max(0.0, deadline - time.monotonic()))
     if "exc" in box:
         raise box["exc"]
     return _result(start, timeout_s, label, value=box.get("value"))

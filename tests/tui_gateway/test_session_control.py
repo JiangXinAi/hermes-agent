@@ -85,6 +85,80 @@ def _error(response):
     return response["error"]
 
 
+def test_lazy_resume_restores_actual_persisted_runtime_without_agent_build(server, hermes_home, monkeypatch):
+    from hermes_state import SessionDB
+    db = SessionDB(hermes_home / "lazy-resume.sqlite3")
+    stored = "source-session-" + uuid.uuid4().hex
+    db.create_session(stored, "capability_service", model="inert-stored-model")
+    db.update_session_meta(stored, json.dumps({"provider": "openrouter", "api_mode": "chat_completions"}))
+    ctx = server._Resume(91, {"lazy": True}, stored)
+    ctx.db, ctx.found = db, db.get_session(stored)
+    monkeypatch.setattr(server, "_default_session_cwd", lambda: str(hermes_home))
+    monkeypatch.setattr(server, "_child_run_active", lambda key: False)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *args: pytest.fail("lazy resume must not start an agent"))
+    response = None
+    try:
+        response = server._resume_lazy(ctx)
+        assert "error" not in response
+        result = response["result"]
+        assert result["info"]["model"] == "inert-stored-model"
+        assert result["info"]["provider"] == "openrouter"
+        record = server._sessions[result["session_id"]]
+        assert record["agent"] is None
+        assert record["lazy"] is True
+        assert record["resume_runtime_overrides"]["provider_override"] == "openrouter"
+        assert not record["agent_ready"].is_set()
+    finally:
+        if response is not None and "result" in response:
+            server._sessions.pop(response["result"]["session_id"], None)
+        db.close()
+
+
+@pytest.mark.parametrize("self_close", [False, True])
+def test_original_close_owner_joins_distinct_workers_and_never_self_certifies(server, monkeypatch, self_close):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from hermes_cli.plugins_dispatch import (execution_worker_target, initial_execution_scope,
+        reserve_execution_resource, retain_execution_worker)
+    events, manager = [], PluginManager()
+    entered, release = threading.Event(), threading.Event()
+    def callback(*, event):
+        events.append((event["phase"], event["resource_kind"]))
+        return {"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True}
+    PluginContext(PluginManifest(name="component-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    initial = initial_execution_scope("inert-runtime", {"session_key": "inert-stored"})
+    session = {"_execution_initial_scopes": [initial]}
+    teardown = []
+    monkeypatch.setattr(server, "_teardown_session", lambda *args, **kwargs: teardown.append(True))
+    handle = reserve_execution_resource("ready_wrapper", "inert-wrapper", parent=initial)
+    def worker():
+        entered.set()
+        assert release.wait(3)
+        if self_close:
+            assert server._teardown_popped_session(session)
+            assert ("joined", "ready_wrapper") not in events
+    thread = threading.Thread(target=execution_worker_target(handle, worker))
+    retain_execution_worker(handle, thread)
+    thread.start()
+    try:
+        assert entered.wait(2)
+        # _run_thread may already have been replaced. The retained original
+        # wrapper still belongs to this close owner and must be joined.
+        session["_run_thread"] = None
+        release.set()
+        if self_close:
+            thread.join(3)
+        else:
+            assert server._teardown_popped_session(session)
+            assert ("joined", "ready_wrapper") in events
+        assert not thread.is_alive()
+        assert teardown == [True]
+    finally:
+        release.set()
+        thread.join(3)
+
+
 def _observe_dispatch(server, monkeypatch):
     calls = []
     original = server._methods["command.dispatch"]

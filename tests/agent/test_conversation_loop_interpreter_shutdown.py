@@ -20,7 +20,44 @@ a clean ``interpreter_shutdown`` exit reason.
 """
 from __future__ import annotations
 
+import types
+import pytest
+
 from agent.conversation_loop import _is_interpreter_shutdown_error
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_original_turn_wrapper_records_exit_and_restores_outer_scope_on_early_return(monkeypatch, raises):
+    import agent.conversation_loop as module
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from hermes_cli.plugins_dispatch import (bind_execution_turn, current_execution_lifecycle,
+        execution_lifecycle_scope, initial_execution_scope, reserve_execution_resource)
+    events, manager = [], PluginManager()
+    def callback(*, event):
+        events.append((event["phase"], event["resource_kind"]))
+        return {"admitted": True, "ticket": object()} if event["phase"] in {"reserve", "bind_turn"} else {"recorded": True}
+    PluginContext(PluginManifest(name="component-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    initial = initial_execution_scope("inert-runtime", {"session_key": "inert-stored"})
+    worker = reserve_execution_resource("conversation_worker", "inert-worker", parent=initial)
+    class ComponentExit(BaseException):
+        pass
+    def early_turn(agent, user_message, **kwargs):
+        bind_execution_turn({"session_id": "inert-stored", "task_id": "inert-task", "turn_id": "inert-turn"})
+        if raises:
+            raise ComponentExit("original component control flow")
+        return {"completed": False}
+    monkeypatch.setattr(module, "_run_conversation_turn", early_turn)
+    with execution_lifecycle_scope(worker):
+        if raises:
+            with pytest.raises(ComponentExit):
+                module.run_conversation(types.SimpleNamespace(), "inert component input")
+        else:
+            assert module.run_conversation(types.SimpleNamespace(), "") == {"completed": False}
+        assert current_execution_lifecycle() is worker
+    assert events.count(("invocation_exited", "turn")) == 1
+    assert not any(phase == "joined" for phase, _ in events)
 
 
 class TestInterpreterShutdownDetection:

@@ -27,6 +27,63 @@ import pytest
 
 from tui_gateway import server
 
+_REAL_THREAD = threading.Thread
+
+
+def test_original_conversation_worker_finally_includes_post_turn_followups(turn_env, monkeypatch, tmp_path):
+    import importlib
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from hermes_cli.plugins_dispatch import join_execution_worker
+    entered, release = threading.Event(), threading.Event()
+    events, manager = [], PluginManager()
+    def callback(*, event):
+        events.append((event["phase"], event["resource_kind"], dict(event["facts"])))
+        return {"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True}
+    PluginContext(PluginManifest(name="component-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    monkeypatch.setattr(server.threading, "Thread", _REAL_THREAD)
+    # This component profile has no live compression/voice/config changes.
+    # Keep the real turn preparation and worker, while avoiding a real profile
+    # config load before the bounded post-followup synchronization point.
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    # There is no active Goal in this worker-lifecycle component. Its goal
+    # lookup is an environment seam, not the real turn/followup target.
+    monkeypatch.setattr(server, "_active_goal_manager", lambda session: None)
+    # The original preparation/finalization uses these real modules. Their
+    # one-time import belongs before this component's Thread/Event interval.
+    importlib.import_module("gateway.run")
+    importlib.import_module("hermes_cli.loops")
+    # No UI is attached to this component. Retain the original settled/cwd
+    # producer and _emit call while omitting unrelated status rendering.
+    monkeypatch.setattr(server, "_session_info", lambda agent, session: {})
+    def followups(*args):
+        entered.set()
+        assert release.wait(3), "component followup release missing"
+    monkeypatch.setattr(server, "_run_post_turn_followups", followups)
+    session = _session(agent=types.SimpleNamespace(session_id="inert-stored",
+        run_conversation=lambda *args, **kwargs: {"final_response": "inert component result"},
+        clear_interrupt=lambda: None), running=True, cwd=str(tmp_path), explicit_cwd=True)
+    try:
+        assert server._run_prompt_submit("inert-request", "inert-runtime", session, "inert component input")
+        assert entered.wait(2)
+        original = session["_run_thread"]
+        assert original in session["_execution_initial_scopes"][0].worker_objects
+        assert original.is_alive()
+        assert ("worker_finally", "conversation_worker") not in [(phase, kind) for phase, kind, _ in events]
+        assert not join_execution_worker(original, timeout=0.01)
+        assert not any(phase == "joined" and kind == "conversation_worker" for phase, kind, _ in events)
+        before_followup_exit = [(phase, kind) for phase, kind, _ in events]
+        assert ("joined", "ticker") in before_followup_exit
+        assert before_followup_exit.index(("worker_finally", "ticker")) < before_followup_exit.index(("joined", "ticker"))
+    finally:
+        release.set()
+        if session.get("_run_thread") is not None:
+            assert join_execution_worker(session["_run_thread"], timeout=3)
+    phases = [(phase, kind) for phase, kind, _ in events]
+    assert phases.index(("scope_sealed", "initial")) < phases.index(("worker_finally", "conversation_worker"))
+    assert phases.index(("worker_finally", "conversation_worker")) < phases.index(("joined", "conversation_worker"))
+
 
 class _InlineThread:
     """Run the turn synchronously so tests observe its final state."""

@@ -149,7 +149,7 @@ class ExecutionLifecycleError(RuntimeError):
 _execution_lifecycle = contextvars.ContextVar("hermes_execution_lifecycle", default=None)
 _EXECUTION_OBSERVATIONS = frozenset({
     "submitted", "dispatch", "outcome", "worker_started", "worker_finally", "invocation_exited",
-    "joined", "not_started", "launch_observed", "launch_unknown", "adopted", "process_exit",
+    "joined", "not_started", "scope_sealed", "launch_observed", "launch_unknown", "adopted", "process_exit",
 })
 
 
@@ -177,6 +177,7 @@ class ExecutionLifecycle:
     resource_kind: str
     resource_id: str
     owners: tuple
+    parent: Optional["ExecutionLifecycle"] = None
 
     @property
     def tracked(self):
@@ -217,7 +218,7 @@ def reserve_execution_resource(resource_kind, resource_id, *, context=None, pare
 
     if parent is None and context is None:
         parent = current_execution_lifecycle()
-    identity = dict(parent.context if parent is not None else (context or {}))
+    identity = dict(context if context is not None else (parent.context if parent is not None else {}))
     callbacks = tuple(owner for owner, _ in parent.owners) if parent is not None else None
     manager = _delivery_manager() if callbacks is None else None
     if callbacks is None:
@@ -236,7 +237,111 @@ def reserve_execution_resource(resource_kind, resource_id, *, context=None, pare
                 or result.get("ticket") is None):
             raise ExecutionLifecycleError("Original execution lifecycle admission refused")
         owners.append((callback, result["ticket"]))
-    return ExecutionLifecycle(MappingProxyType(identity), resource_kind, resource_id, tuple(owners))
+    return ExecutionLifecycle(MappingProxyType(identity), resource_kind, resource_id, tuple(owners), parent)
+
+
+_INITIAL_PARTICIPANTS = ("agent_build", "ready_wrapper", "conversation_worker", "ticker",
+                         "turn", "tool", "work_item", "pool_worker", "heartbeat", "process",
+                         "process_reader", "deadline", "background_review")
+
+
+def current_initial_execution_scope():
+    handle = current_execution_lifecycle()
+    while handle is not None:
+        if handle.resource_kind == "initial":
+            return handle
+        handle = handle.parent
+    return None
+
+
+def initial_execution_scope(sid, session, *, fresh=False):
+    """The original session producer supplies identity before any thread starts."""
+    from uuid import uuid4
+    context = {"session_id": sid, "stored_session_id": str(session.get("session_key") or ""),
+               "native_cursor": int(session.get("_queued_prompt_generation", 0))}
+    existing = current_initial_execution_scope()
+    if not fresh and existing is not None and existing.context == context:
+        return existing
+    handle = reserve_execution_resource("initial", uuid4().hex, context=context)
+    handle.worker_objects = []  # Original objects on this invocation; never a registry.
+    handle.observe("submitted", declared_kinds=_INITIAL_PARTICIPANTS)
+    return handle
+
+
+def bind_execution_turn(context):
+    """Bind identities issued by the real turn producer, never guessed before start."""
+    from hermes_cli.plugins import _delivery_manager
+    parent = current_execution_lifecycle()
+    initial = current_initial_execution_scope()
+    identity = dict(context)
+    if initial is not None:
+        identity.update({"runtime_session_id": initial.context["session_id"],
+                         "stored_session_id": initial.context["stored_session_id"],
+                         "native_cursor": initial.context["native_cursor"]})
+    owners = []
+    callbacks = tuple(owner for owner, _ in parent.owners) if parent is not None else _delivery_manager().iter_hook_callbacks("execution_lifecycle")
+    for callback in callbacks:
+        result = _execution_callback(callback, MappingProxyType({"phase": "bind_turn",
+            "resource_kind": "turn", "resource_id": identity["turn_id"], "context": MappingProxyType(identity),
+            "parent_ticket": parent.ticket_for(callback) if parent is not None else None, "facts": MappingProxyType({})}))
+        if result is None:
+            continue
+        if not isinstance(result, Mapping) or result.get("admitted") is not True or result.get("ticket") is None:
+            raise ExecutionLifecycleError("Original turn binding unavailable")
+        owners.append((callback, result["ticket"]))
+    handle = ExecutionLifecycle(MappingProxyType(identity), "turn", identity["turn_id"], tuple(owners), parent)
+    if owners or parent is not None:
+        _execution_lifecycle.set(handle)  # The original outer invocation restores its scope.
+    return handle
+
+
+def execution_worker_target(handle, target):
+    """Keep the original target/profile and report real finally separately from join."""
+    context = contextvars.copy_context()
+    def invoke(*args, **kwargs):
+        with execution_lifecycle_scope(handle):
+            try:
+                handle.observe("worker_started", thread_ident=threading.get_ident())
+                return target(*args, **kwargs)
+            finally:
+                try:
+                    # This target includes the original post-turn followups.
+                    # Closing admission does not claim this worker was joined.
+                    if handle.resource_kind == "conversation_worker":
+                        initial = current_initial_execution_scope()
+                        if initial is not None:
+                            initial.observe("scope_sealed")
+                finally:
+                    handle.observe("worker_finally", thread_ident=threading.get_ident())
+    return lambda *args, **kwargs: context.run(invoke, *args, **kwargs)
+
+
+def retain_execution_worker(handle, thread):
+    thread._execution_lifecycle = handle
+    thread._execution_observation_context = contextvars.copy_context()
+    ancestor = handle
+    while ancestor is not None and ancestor.resource_kind != "initial":
+        ancestor = ancestor.parent
+    if ancestor is not None and ancestor.tracked:
+        ancestor.worker_objects.append(thread)
+
+
+def join_execution_worker(thread, timeout=None):
+    """Only the original owner's actual join/readback can issue this observation."""
+    if thread is threading.current_thread():
+        return False
+    ident = getattr(thread, "ident", None)
+    if ident is None and hasattr(thread, "ident"):
+        return False  # Original Thread was never started.
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        return False
+    handle = getattr(thread, "_execution_lifecycle", None)
+    if handle is not None and handle.tracked:
+        if ident is None:
+            return False  # An inline substitute cannot attest a physical join.
+        thread._execution_observation_context.run(handle.observe, "joined", thread_ident=ident)
+    return ident is not None
 
 
 def fence_execution_resources(context):

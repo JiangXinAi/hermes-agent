@@ -1088,6 +1088,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
     with session.setdefault("agent_build_lock", threading.Lock()):
         if ready.is_set() or session.get("agent_build_started"):
             return
+        from hermes_cli.plugins_dispatch import initial_execution_scope, reserve_execution_resource
+        from uuid import uuid4
+        initial = initial_execution_scope(sid, session)
+        handle = reserve_execution_resource("agent_build", uuid4().hex, parent=initial)
         session["agent_build_started"] = True
         session.pop("lazy", None)  # now genuinely mid-construction: restore the "still starting" eviction exemption
     key = session["session_key"]
@@ -1132,10 +1136,19 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 sid, key, current, notify_registered=notify_registered, scopes=scopes, session_db=session_db)
             ready.set()
 
-    build_thread = threading.Thread(target=_build, daemon=True)
+    from hermes_cli.plugins_dispatch import execution_worker_target, retain_execution_worker
+    build_thread = threading.Thread(target=execution_worker_target(handle, _build), daemon=True)
+    retain_execution_worker(handle, build_thread)
+    if initial.tracked and not any(scope is initial for scope in session.setdefault("_execution_initial_scopes", [])):
+        session["_execution_initial_scopes"].append(initial)
     # _wait_agent_for_prompt handle: dead thread + unset agent_ready = died hard; waiters must not sit out the cap.
     session["_agent_build_thread"] = build_thread
-    build_thread.start()
+    try:
+        build_thread.start()
+    except BaseException:
+        session["agent_build_started"] = False
+        handle.observe("not_started")
+        raise
 
 
 def _sess_nowait(params, rid):
@@ -3083,8 +3096,16 @@ def _start_usage_ticker(sid: str, agent, interval: float = 1.0) -> tuple[threadi
                 if stop.is_set():
                     break  # turn ended while snapshotting; message.complete carries the authoritative usage
                 _emit("session.usage", sid, {"usage": usage})
-    thread = _RealThread(target=_loop, daemon=True)
-    thread.start()
+    from hermes_cli.plugins_dispatch import (reserve_execution_resource, execution_worker_target, retain_execution_worker)
+    from uuid import uuid4
+    handle = reserve_execution_resource("ticker", uuid4().hex)
+    thread = _RealThread(target=execution_worker_target(handle, _loop), daemon=True)
+    retain_execution_worker(handle, thread)
+    try:
+        thread.start()
+    except BaseException:
+        handle.observe("not_started")
+        raise
     return stop, thread
 
 

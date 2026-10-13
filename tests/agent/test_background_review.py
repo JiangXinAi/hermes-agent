@@ -11,6 +11,31 @@ from run_agent import AIAgent
 _REAL_THREAD = threading.Thread
 
 
+def test_background_review_admission_refusal_precedes_review_state_and_thread(monkeypatch):
+    import pytest
+    import agent.background_review as review_module
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from hermes_cli.plugins_dispatch import ExecutionLifecycleError, execution_lifecycle_scope, initial_execution_scope
+    manager, events = PluginManager(), []
+    def callback(*, event):
+        events.append((event["phase"], event["resource_kind"]))
+        if event["phase"] == "reserve" and event["resource_kind"] == "background_review":
+            raise ValueError("component original review admission refused")
+        return {"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True}
+    PluginContext(PluginManifest(name="component-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    monkeypatch.setattr(review_module, "prepare_background_review_run",
+        lambda *args: pytest.fail("refused review cannot prepare mutable state"))
+    initial = initial_execution_scope("inert-runtime", {"session_key": "inert-stored"})
+    agent = _bare_agent()
+    with execution_lifecycle_scope(initial), pytest.raises(ExecutionLifecycleError):
+        AIAgent._spawn_background_review_now(agent, messages_snapshot=[], review_memory=True)
+    assert events[-1] == ("reserve", "background_review")
+    assert initial.worker_objects == []
+    assert agent._background_review_run is None
+
+
 class _TurnBoundaryReached(Exception):
     """Stop a live turn exactly when it reaches turn-context construction."""
 

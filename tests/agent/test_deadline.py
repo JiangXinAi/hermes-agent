@@ -35,9 +35,81 @@ from agent.deadline import (
 )
 
 
+@pytest.mark.parametrize("inside_tool", [False, True])
+def test_timeout_retains_original_deadline_worker_until_owner_join(monkeypatch, inside_tool):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from hermes_cli.plugins_dispatch import (execution_lifecycle_scope, initial_execution_scope, join_execution_worker,
+        reserve_execution_resource)
+    entered, release = threading.Event(), threading.Event()
+    events, manager = [], PluginManager()
+    def callback(*, event):
+        events.append((event["phase"], event["resource_kind"]))
+        return {"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True}
+    PluginContext(PluginManifest(name="component-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    initial = initial_execution_scope("inert-runtime", {"session_key": "inert-stored"})
+    parent = (reserve_execution_resource("tool", "inert-original-tool", parent=initial,
+        context={"session_id": "inert-stored", "task_id": "inert-task", "turn_id": "inert-turn",
+            "tool_call_id": "inert-call", "original_args": {}}) if inside_tool else initial)
+    def work():
+        entered.set()
+        assert release.wait(3)
+        return "inert component result"
+    try:
+        with execution_lifecycle_scope(parent):
+            result = run_bounded_sync(work, timeout=0.05, label="inert component deadline")
+        assert result.timed_out
+        assert entered.is_set()
+        assert len(initial.worker_objects) == 1
+        original = initial.worker_objects[0]
+        assert original._execution_lifecycle.parent is parent
+        assert original._execution_lifecycle.context["session_id"] == "inert-runtime"
+        assert original._execution_lifecycle.context["stored_session_id"] == "inert-stored"
+        assert original.is_alive()
+        assert ("worker_finally", "deadline") not in events
+        assert ("joined", "deadline") not in events
+    finally:
+        release.set()
+        for thread in initial.worker_objects:
+            assert join_execution_worker(thread, timeout=3)
+    assert events.index(("worker_finally", "deadline")) < events.index(("joined", "deadline"))
+
+
 # ---------------------------------------------------------------------------
 # clamp_timeout
 # ---------------------------------------------------------------------------
+
+
+def test_worker_start_refusal_reaches_original_deadline_caller_without_timeout_recovery(monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from hermes_cli.plugins_dispatch import (ExecutionLifecycleError, execution_lifecycle_scope, initial_execution_scope)
+    manager, events, calls = PluginManager(), [], []
+    def callback(*, event):
+        events.append((event["phase"], event["resource_kind"]))
+        if event["phase"] == "worker_started":
+            raise ValueError("inert current owner rejects actual startup")
+        return {"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True}
+    PluginContext(PluginManifest(name="component-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    initial = initial_execution_scope("inert-runtime", {"session_key": "inert-stored"})
+    started = time.monotonic()
+    try:
+        with execution_lifecycle_scope(initial), pytest.raises(ExecutionLifecycleError) as refused:
+            run_bounded_sync(lambda: calls.append("fn"), timeout=2,
+                on_timeout=lambda: calls.append("on_timeout"), label="inert startup refusal")
+        assert str(refused.value) == "Original execution lifecycle unavailable"
+        assert time.monotonic() - started < 1
+        assert calls == []
+        assert events.index(("reserve", "deadline")) < events.index(("worker_started", "deadline"))
+        assert ("worker_finally", "deadline") in events
+        assert ("joined", "deadline") in events
+        assert len(initial.worker_objects) == 1
+        assert not initial.worker_objects[0].is_alive()
+    finally:
+        for thread in initial.worker_objects:
+            thread.join(3)
 
 
 class TestClampTimeout:

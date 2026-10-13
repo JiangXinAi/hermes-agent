@@ -253,3 +253,32 @@ def test_join_observation_refusal_preserves_owned_cleanup_and_persistence(monkey
     finally:
         refuse_join[0] = False
         pool.shutdown(wait=True)
+
+
+def test_finalizer_reconciles_original_background_worker_without_joining_its_caller(monkeypatch):
+    import threading
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from hermes_cli.plugins_dispatch import (execution_lifecycle_scope, execution_worker_target,
+        initial_execution_scope, reserve_execution_resource, retain_execution_worker)
+    manager, phases = PluginManager(), []
+    def callback(*, event):
+        phases.append((event["phase"], event["resource_kind"]))
+        return {"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True}
+    PluginContext(PluginManifest(name="component-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    initial = initial_execution_scope("inert-runtime", {"session_key": "inert-stored"})
+    handle = reserve_execution_resource("background_review", "inert-original-review", parent=initial)
+    finished = threading.Event()
+    original = threading.Thread(target=execution_worker_target(handle, finished.set))
+    retain_execution_worker(handle, original)
+    original.start()
+    try:
+        assert finished.wait(2)
+        with execution_lifecycle_scope(initial):
+            _run(_StubAgent(raise_in=()), final_response="inert finite component result", api_call_count=1)
+        assert not original.is_alive()
+        assert phases.index(("worker_finally", "background_review")) < phases.index(("joined", "background_review"))
+        assert not any(phase == "joined" and kind in {"initial", "turn", "conversation_worker"} for phase, kind in phases)
+    finally:
+        original.join(3)

@@ -565,7 +565,8 @@ def _invoke_agent(
         # Stop AND join before anything emits: a tick surviving past message.complete would
         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).
         _usage_stop.set()
-        _usage_thread.join()
+        from hermes_cli.plugins_dispatch import join_execution_worker
+        join_execution_worker(_usage_thread)
 
 
 def _absorb_turn_result(
@@ -803,6 +804,18 @@ def _run_prompt_submit(
     if admitted is None:
         return False
     images, agent = admitted
+    from hermes_cli.plugins_dispatch import (
+        initial_execution_scope, execution_worker_target, retain_execution_worker,
+        reserve_execution_resource,
+    )
+    from uuid import uuid4
+    try:
+        initial = initial_execution_scope(sid, session)
+        handle = reserve_execution_resource("conversation_worker", uuid4().hex, parent=initial)
+    except BaseException:
+        with session["history_lock"]:
+            session["running"] = False
+        raise
     # The ONE INFO record proving a prompt was accepted by THIS process; ties ui sid,
     # session_key and the agent's live session_id together.  No prompt content is logged.
     _turn_started_monotonic = time.monotonic()
@@ -888,7 +901,10 @@ def _run_prompt_submit(
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, st.agent)
         _run_post_turn_followups(rid, sid, session, st.result, goal_followup)
-    run_thread = threading.Thread(target=run, daemon=True)
+    run_thread = threading.Thread(target=execution_worker_target(handle, run), daemon=True)
+    retain_execution_worker(handle, run_thread)
+    if initial.tracked and not any(scope is initial for scope in session.setdefault("_execution_initial_scopes", [])):
+        session["_execution_initial_scopes"].append(initial)
     # The handle is resolved BEFORE _sessions_lock: a profile session opens its own SessionDB through the
     # state registry, and _sessions_lock gates every create/close/prompt on this backend.
     with _routing_provenance_db(session) as routing_db, _sessions_lock:
@@ -900,8 +916,19 @@ def _run_prompt_submit(
             if registered is session:
                 _reopen_routed_session_row(routing_db, sid, session)
             session["_run_thread"] = run_thread
-            run_thread.start()
+            try:
+                run_thread.start()
+            except BaseException:
+                try:
+                    handle.observe("not_started")
+                    initial.observe("scope_sealed")
+                finally:
+                    with session["history_lock"]:
+                        session["running"] = False
+                raise
     if not can_start:
+        handle.observe("not_started")
+        initial.observe("scope_sealed")
         with session["history_lock"]:
             session["running"] = False
     return can_start

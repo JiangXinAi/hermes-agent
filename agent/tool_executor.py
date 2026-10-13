@@ -627,9 +627,9 @@ def _run_with_activity_heartbeat(agent, function_name: str, fn):
 
 
 def _reserve_tool_lifecycle(agent, ref):
-    from hermes_cli.plugins_dispatch import reserve_execution_resource
+    from hermes_cli.plugins_dispatch import reserve_execution_resource, current_execution_lifecycle
 
-    return reserve_execution_resource("tool", ref.call_id, context={
+    return reserve_execution_resource("tool", ref.call_id, parent=current_execution_lifecycle(), context={
         **tool_hook_ids(agent, ref.task_id, ref.call_id), "tool_name": ref.name,
         "original_args": copy.deepcopy(ref.args),
     })
