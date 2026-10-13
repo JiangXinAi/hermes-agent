@@ -909,10 +909,24 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def _track_started(self, session: ProcessSession, reader_target, reader_name: str, extra_args=()) -> None:
         """Register before the reader can publish completion, even for an exited child."""
         from contextvars import copy_context
+        from hermes_cli.plugins_dispatch import reserve_execution_resource
+
+        parent = getattr(session, "_execution_lifecycle", None)
+        lifecycle = (reserve_execution_resource("process_reader", reader_name, parent=parent)
+                     if parent is not None and parent.tracked else None)
+        reader_context = copy_context()
+
+        def read_original():
+            try:
+                reader_target(session, *extra_args)
+            finally:
+                if lifecycle is not None:
+                    lifecycle.observe("worker_finally", thread_ident=threading.get_ident())
 
         # Reader completion must retain the producer's multiplex profile scope.
-        reader = threading.Thread(target=copy_context().run, args=(reader_target, session, *extra_args),
+        reader = threading.Thread(target=reader_context.run, args=(read_original,),
                                   daemon=True, name=reader_name)
+        reader._execution_lifecycle = lifecycle
         session._reader_thread = reader
         with self._lock:
             self._prune_if_needed()
@@ -922,6 +936,20 @@ class ProcessRegistry(ProcessCheckpointMixin):
             self._running[session.id] = session
         self._write_checkpoint()
 
+    def prepare_local_launch(self, command, cwd=None, task_id="", session_key="", owner_task_id=""):
+        """Allocate the original session identity before a foreground/background launch."""
+        from hermes_cli.plugins_dispatch import reserve_execution_resource
+        session = self._new_session(command, task_id, owner_task_id, session_key, cwd)
+        session._execution_lifecycle = reserve_execution_resource("process", session.id)
+        return session
+
+    def bind_local_launch(self, session, proc):
+        session.process, session.pid = proc, proc.pid
+        session.host_start_time = self._safe_host_start_time(proc.pid)
+        proc._execution_session = session
+        session._execution_lifecycle.observe("launch_observed", pid=proc.pid,
+            start_ticks=session.host_start_time, pid_scope="host", process_id=session.id)
+
     def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
         """PTY spawn for interactive CLI tools (Codex, Claude Code, REPLs).
         Raises ImportError when no PTY backend is installed and re-raises any spawn
@@ -930,6 +958,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             from winpty import PtyProcess as _PtyProcessCls
         else:
             from ptyprocess import PtyProcess as _PtyProcessCls
+        session._pty_backend_loaded = True
         pty_argv = self._scope_argv(session, safe_command, session.id, "PTY")
         pty_env = self._spawn_env(env_vars)
         if session.systemd_unit:
@@ -942,7 +971,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
         session.pid = pty_proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
         session._pty = pty_proc
-        self._track_started(session, self._pty_reader_loop, f"proc-pty-reader-{session.id}")
+        try:
+            session._execution_lifecycle.observe("launch_observed", pid=session.pid,
+                start_ticks=session.host_start_time, pid_scope="host", process_id=session.id)
+            self._track_started(session, self._pty_reader_loop, f"proc-pty-reader-{session.id}")
+        except BaseException:
+            if session._execution_lifecycle.tracked and session.host_start_time is not None:
+                with suppress(Exception):
+                    self._terminate_host_pid(session.pid, session.host_start_time)
+            raise
         return session
 
     def spawn_local(
@@ -959,13 +996,23 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
         safe_command = _rewrite_bg(command)
         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()))
+        from hermes_cli.plugins_dispatch import reserve_execution_resource, ExecutionLifecycleError
+        session._execution_lifecycle = reserve_execution_resource("process", session.id)
         pty_scope_attempted = False
         if use_pty:
             try:
                 return self._spawn_local_pty(session, safe_command, env_vars)
             except ImportError:
+                if session._execution_lifecycle.tracked and getattr(session, "_pty_backend_loaded", False):
+                    session._execution_lifecycle.observe("launch_unknown", pid_scope="host")
+                    raise ExecutionLifecycleError("Original PTY launch outcome unknown") from None
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                if session._execution_lifecycle.tracked:
+                    # The PTY may have launched before losing its ACK/tracking.
+                    # Never replay that tracked command through the pipe fallback.
+                    session._execution_lifecycle.observe("launch_unknown", pid_scope="host")
+                    raise ExecutionLifecycleError("Original PTY launch outcome unknown") from None
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
                 if session.systemd_unit:
                     pty_scope_attempted = True
@@ -987,16 +1034,18 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # share the foreground process group and background spawns would stop the whole
         # session (observed as dead TUIs in state T). Cgroup isolation is unaffected —
         # the scope attaches to the invoked process, not the spawning session.
-        proc = subprocess.Popen(
-            spawn_argv, text=True, cwd=session.cwd, env=spawn_env, encoding="utf-8",
-            errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            start_new_session=True, **_popen_kwargs)
-        session.process = proc
-        session.pid = proc.pid
-        session.host_start_time = self._safe_host_start_time(session.pid)
         try:
+            proc = subprocess.Popen(
+                spawn_argv, text=True, cwd=session.cwd, env=spawn_env, encoding="utf-8",
+                errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                start_new_session=True, **_popen_kwargs)
+        except BaseException:
+            session._execution_lifecycle.observe("launch_unknown", pid_scope="host")
+            raise
+        try:
+            self.bind_local_launch(session, proc)
             self._track_started(session, self._reader_loop, f"proc-reader-{session.id}")
-        except Exception:
+        except BaseException:
             self._reap_untracked(session, proc)
             raise
         return session
@@ -1004,6 +1053,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def _reap_untracked(self, session: ProcessSession, proc: subprocess.Popen) -> None:
         """Post-Popen setup failed: kill the orphaned subprocess (and any setsid
         descendants) so nothing leaks untracked."""
+        lifecycle = getattr(session, "_execution_lifecycle", None)
+        if lifecycle is not None and lifecycle.tracked:
+            # Do not turn a delayed callback failure into a signal to a reused
+            # PID. Without the original live baseline, only wait/read is safe.
+            if (proc.poll() is not None or session.host_start_time is None
+                    or not self._host_pid_is_ours(proc.pid, session.host_start_time)):
+                with suppress(Exception):
+                    proc.wait(timeout=5)
+                return
         with suppress(Exception):
             if session.systemd_unit:
                 # Scope teardown is the authoritative cleanup for the worker cgroup
@@ -1033,10 +1091,27 @@ class ProcessRegistry(ProcessCheckpointMixin):
         The caller has stopped its own drain thread; the registry's reader continues from
         the pipe's current position and ``output_so_far`` seeds the buffer so nothing
         already captured is lost."""
-        session = self._new_session(command, task_id, owner_task_id, session_key, cwd)
+        from hermes_cli.plugins_dispatch import current_execution_lifecycle, ExecutionLifecycleError
+        session = getattr(proc, "_execution_session", None)
+        if session is None:
+            parent = current_execution_lifecycle()
+            if parent is not None and parent.tracked:
+                raise ExecutionLifecycleError("Original foreground launch reservation required")
+            session = self._new_session(command, task_id, owner_task_id, session_key, cwd)
+        else:
+            if session.process is not proc or session.pid != proc.pid:
+                raise RuntimeError("Original foreground process owner changed")
+            parent = current_execution_lifecycle()
+            if (parent is not None and parent.tracked
+                    and parent.context != session._execution_lifecycle.context):
+                raise ExecutionLifecycleError("Original foreground execution context changed")
+            session.task_id, session.owner_task_id, session.session_key = task_id, owner_task_id, session_key
+            session._execution_lifecycle.observe("adopted", process_id=session.id, pid=proc.pid,
+                start_ticks=session.host_start_time, pid_scope="host")
         session.process = proc
         session.pid = proc.pid
-        session.host_start_time = self._safe_host_start_time(session.pid)
+        if getattr(session, "_execution_lifecycle", None) is None:
+            session.host_start_time = self._safe_host_start_time(session.pid)
         session.notify_on_complete = notify_on_complete
         if output_so_far:
             session.append_output(output_so_far)
@@ -1051,6 +1126,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         log file that later execute() calls poll. No live pipe or stdin, but it runs in
         the correct sandbox context."""
         session = self._new_session(command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox")
+        from hermes_cli.plugins_dispatch import reserve_execution_resource, ExecutionLifecycleError
+        session._execution_lifecycle = reserve_execution_resource("process", session.id)
         temp_dir = self._env_temp_dir(env)
         log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
         q = shlex.quote
@@ -1069,8 +1146,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 session.mark_exited(int(result.get("returncode", -1)) or -1, "failed_start", "failed_start")
                 session.output_buffer = output
         except Exception as e:
+            if session._execution_lifecycle.tracked:
+                session._execution_lifecycle.observe("launch_unknown", pid_scope="sandbox")
+                raise ExecutionLifecycleError("Original environment launch outcome unknown") from None
             session.mark_exited(-1, "failed_start", "failed_start")
             session.output_buffer = f"Failed to start: {e}"
+        session._execution_lifecycle.observe(
+            "launch_unknown" if session.pid is None else "launch_observed",
+            pid=session.pid, start_ticks=None, pid_scope="sandbox", process_id=session.id)
         if session.exited:
             with self._lock:
                 self._prune_if_needed()
@@ -1322,6 +1405,32 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """Mark a reader-observed exit (a raced kill keeps its own code/reason) and finish."""
         session.mark_exited(exit_code)
         self._move_to_finished(session)
+        lifecycle = getattr(session, "_execution_lifecycle", None)
+        if lifecycle is not None and exit_code is not None:
+            lifecycle.observe("process_exit", process_id=session.id, pid=session.pid,
+                start_ticks=session.host_start_time, pid_scope=session.pid_scope, exit_code=exit_code)
+
+    def reconcile_execution_lifecycle(self, context, timeout=0.0):
+        """Join original reader objects only; this never closes a process inventory."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._lock:
+            sessions = tuple(self._running.values()) + tuple(self._finished.values())
+        pending = 0
+        for session in sessions:
+            parent = getattr(session, "_execution_lifecycle", None)
+            reader = getattr(session, "_reader_thread", None)
+            if (parent is None or not parent.tracked or reader is None
+                    or any(parent.context.get(key) != context.get(key)
+                           for key in ("session_id", "task_id", "turn_id"))):
+                continue
+            lifecycle = getattr(reader, "_execution_lifecycle", None)
+            if lifecycle is not None:
+                reader.join(max(0.0, deadline - time.monotonic()))
+                if reader.is_alive():
+                    pending += 1
+                else:
+                    lifecycle.observe("joined", thread_ident=reader.ident)
+        return pending
 
     def _move_to_finished(self, session: ProcessSession):
         """Move a session from running to finished.

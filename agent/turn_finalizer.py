@@ -458,6 +458,40 @@ def finalize_turn(
 
     _rollback_interrupted_preflight_display(agent, interrupted)
 
+    from hermes_cli.plugins_dispatch import fence_execution_resources
+    # End-of-turn is only an admission fence, never the outer worker's join.
+    execution_context = {"session_id": agent.session_id,
+                         "task_id": effective_task_id, "turn_id": turn_id}
+    lifecycle_failure = None
+    try:
+        fence_execution_resources(execution_context)
+    except BaseException as error:
+        lifecycle_failure = error
+    import time
+    join_deadline = time.monotonic() + 2.0
+    retained_pools = []
+    for pool in getattr(agent, "_tool_lifecycle_pools", ()):
+        try:
+            if pool.reconcile_execution_lifecycle(timeout=max(0.0, join_deadline - time.monotonic())):
+                retained_pools.append(pool)
+        except BaseException as error:
+            # Keep the original owner for later reconciliation; an unavailable
+            # observation must not discard it or skip other owned cleanup.
+            retained_pools.append(pool)
+            if lifecycle_failure is None:
+                lifecycle_failure = error
+    if retained_pools or hasattr(agent, "_tool_lifecycle_pools"):
+        agent._tool_lifecycle_pools = retained_pools
+    try:
+        from tools.process_registry import process_registry
+        process_registry.reconcile_execution_lifecycle(
+            execution_context, timeout=max(0.0, join_deadline - time.monotonic()))
+    except BaseException as error:
+        if lifecycle_failure is None:
+            lifecycle_failure = error
+    if lifecycle_failure is not None:
+        completed, failed = False, True
+
     _cleanup_errors: List[str] = []
     # ``user_message`` may be a multimodal list of parts; the trajectory format wants a string.
     _guarded_cleanup(
@@ -491,6 +525,12 @@ def finalize_turn(
     # cleanup error, so a later prompt isn't sent with a pre-turn snapshot.
     with suppress(Exception):
         agent._session_messages = messages
+
+    # Already-owned teardown and the durable transcript tail above run even
+    # after a strict lifecycle refusal. Do not transform/deliver a success or
+    # create background work; propagate that original refusal after cleanup.
+    if lifecycle_failure is not None:
+        raise lifecycle_failure
 
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
 

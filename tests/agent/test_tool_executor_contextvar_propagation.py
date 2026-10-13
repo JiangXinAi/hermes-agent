@@ -158,3 +158,23 @@ def test_two_concurrent_tool_batches_keep_session_keys_isolated():
     assert results.get("B") == "session-B", (
         f"Session B worker saw {results.get('B')!r}, expected 'session-B'"
     )
+
+
+def test_original_tool_admission_refusal_precedes_sequential_dispatch(monkeypatch):
+    import pytest
+    from types import SimpleNamespace
+    from agent.tool_executor import _run_sequential_tool_execution_middleware
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+    from hermes_cli.plugins_dispatch import ExecutionLifecycleError
+    manager = PluginManager()
+    def refuse(*, event):
+        raise ValueError("inert owner refusal")
+    PluginContext(PluginManifest(name="bounded-owner"), manager).register_hook("execution_lifecycle", refuse)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    invoked = []
+    agent = SimpleNamespace(session_id="original-session", _current_turn_id="original-turn", _current_api_request_id="original-request")
+    with pytest.raises(ExecutionLifecycleError):
+        _run_sequential_tool_execution_middleware(agent, function_name="terminal", function_args={},
+            effective_task_id="original-task", tool_call_id="original-call", execute=lambda args: invoked.append(args))
+    assert invoked == []

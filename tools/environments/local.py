@@ -803,12 +803,29 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
-        proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True, cwd=self.cwd,
-            **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+        from hermes_cli.plugins_dispatch import current_execution_lifecycle
+        lifecycle = current_execution_lifecycle()
+        session = None
+        if lifecycle is not None and lifecycle.tracked:
+            from tools.process_registry import process_registry
+            session = process_registry.prepare_local_launch(cmd_string, self.cwd)
+        try:
+            proc = subprocess.Popen(
+                args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                start_new_session=True, cwd=self.cwd,
+                **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+        except BaseException:
+            if session is not None:
+                session._execution_lifecycle.observe("launch_unknown", pid_scope="host")
+            raise
+        if session is not None:
+            try:
+                process_registry.bind_local_launch(session, proc)
+            except BaseException:
+                process_registry._reap_untracked(session, proc)
+                raise
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):
                 proc._hermes_pgid = os.getpgid(proc.pid)

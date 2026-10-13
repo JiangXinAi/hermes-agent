@@ -86,3 +86,38 @@ def test_yield_request_without_steer_leaves_foreground_wait_alone():
     finally:
         interrupt_mod.consume_yield(threading.current_thread().ident)
         env.cleanup()
+
+
+def test_adoption_keeps_original_prelaunch_session_and_start_baseline(tmp_path, monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+    from hermes_cli.plugins_dispatch import reserve_execution_resource, execution_lifecycle_scope
+    from tools.environments.local import LocalEnvironment
+    manager = PluginManager()
+    events = []
+    def callback(*, event):
+        events.append((event["resource_id"], event["phase"]))
+        return ({"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True})
+    PluginContext(PluginManifest(name="bounded-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    context = {"session_id": "original-session", "task_id": "original-task", "turn_id": "original-turn"}
+    original = reserve_execution_resource("tool", "original-call", context=context)
+    env = LocalEnvironment(cwd=str(tmp_path))
+    try:
+        with execution_lifecycle_scope(original):
+            proc = env._run_bash("sleep 0.1")
+            before = proc._execution_session
+            baseline = before.host_start_time
+            adopted = process_registry.adopt_local(proc, command="sleep 0.1", cwd=str(tmp_path),
+                task_id="original-task", owner_task_id="original-task", session_key="original-session",
+                notify_on_complete=False)
+        assert adopted is before
+        assert adopted.host_start_time == baseline
+        assert events.count((before.id, "reserve")) == 1
+        assert (before.id, "adopted") in events
+        assert adopted._completion_event.wait(5)
+        assert process_registry.reconcile_execution_lifecycle(context, 5) == 0
+    finally:
+        if 'proc' in locals():
+            proc.wait(timeout=5)
+        env.cleanup()

@@ -195,3 +195,61 @@ def test_persist_disabled_turn_skips_session_end_hook(
     assert calls == expected_calls
 
 
+
+
+def test_finalizer_owner_fence_failure_cannot_be_reported_as_a_join(monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+    from hermes_cli.plugins_dispatch import ExecutionLifecycleError
+    manager = PluginManager()
+    phases = []
+    def refuse(*, event):
+        phases.append(event["phase"])
+        raise ValueError("original fence unavailable")
+    PluginContext(PluginManifest(name="bounded-owner"), manager).register_hook("execution_lifecycle", refuse)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    agent = _StubAgent(raise_in=())
+    cleanups, trajectory_completion = [], []
+    monkeypatch.setattr(agent, "_cleanup_task_resources", lambda task_id: cleanups.append(("cleanup", task_id)))
+    monkeypatch.setattr(agent, "_persist_session", lambda *args: cleanups.append(("persist", None)))
+    monkeypatch.setattr(agent, "_save_trajectory", lambda messages, user, completed: trajectory_completion.append(completed))
+    with pytest.raises(ExecutionLifecycleError):
+        _run(agent, final_response="inert finite result", api_call_count=2)
+    assert phases == ["fence"]
+    assert cleanups == [("cleanup", "task-1"), ("persist", None)]
+    assert trajectory_completion == [False]
+
+
+
+def test_join_observation_refusal_preserves_owned_cleanup_and_persistence(monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+    from hermes_cli.plugins_dispatch import ExecutionLifecycleError, reserve_execution_resource, execution_lifecycle_scope
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+    manager, phases, cleanups = PluginManager(), [], []
+    refuse_join = [True]
+    def callback(*, event):
+        phases.append(event["phase"])
+        if event["phase"] == "joined" and refuse_join[0]:
+            raise ValueError("original join observation unavailable")
+        return ({"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True})
+    PluginContext(PluginManifest(name="bounded-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    original = reserve_execution_resource("tool", "original-call", context={})
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    try:
+        with execution_lifecycle_scope(original):
+            assert pool.submit(lambda: "inert-component-result").result(5) == "inert-component-result"
+        pool.shutdown(wait=False)
+        agent = _StubAgent(raise_in=())
+        agent._tool_lifecycle_pools = [pool]
+        monkeypatch.setattr(agent, "_cleanup_task_resources", lambda task_id: cleanups.append("cleanup"))
+        monkeypatch.setattr(agent, "_persist_session", lambda *args: cleanups.append("persist"))
+        with pytest.raises(ExecutionLifecycleError):
+            _run(agent, final_response="inert finite result", api_call_count=2)
+        assert phases.index("worker_finally") < phases.index("joined")
+        assert cleanups == ["cleanup", "persist"]
+        assert agent._tool_lifecycle_pools == [pool]
+    finally:
+        refuse_join[0] = False
+        pool.shutdown(wait=True)

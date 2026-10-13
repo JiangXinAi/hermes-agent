@@ -2453,3 +2453,47 @@ class TestDispatchToolWithoutCliRef:
             assert calls[0][1].get("parent_agent") is None
         finally:
             registry.deregister("_test_dispatch_probe")
+
+
+@pytest.mark.parametrize("refusal", ["raises", "malformed", "async"])
+def test_execution_lifecycle_refusal_propagates_synchronously(refusal, monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins_dispatch import ExecutionLifecycleError, reserve_execution_resource
+    manager = PluginManager()
+    ctx = PluginContext(PluginManifest(name="bounded-owner"), manager)
+    entered = []
+    async def asynchronous(*, event):
+        entered.append(event)
+        return {"admitted": True, "ticket": "inert-observation"}
+    def callback(*, event):
+        entered.append(event)
+        if refusal == "raises":
+            raise ValueError("private owner error")
+        return {"admitted": False, "ticket": "inert-observation"}
+    registration = ctx.register_hook("execution_lifecycle", asynchronous if refusal == "async" else callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    try:
+        with pytest.raises(ExecutionLifecycleError) as rejected:
+            reserve_execution_resource("tool", "original-call", context={"task_id": "original-task"})
+        assert "private owner error" not in str(rejected.value)
+        assert len(entered) == (0 if refusal == "async" else 1)
+    finally:
+        registration.dispose()
+
+
+def test_execution_lifecycle_keeps_original_registration_for_reserved_observations(monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins_dispatch import reserve_execution_resource
+    manager = PluginManager()
+    ctx = PluginContext(PluginManifest(name="bounded-owner"), manager)
+    observed = []
+    def callback(*, event):
+        observed.append(event["phase"])
+        return ({"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True})
+    registration = ctx.register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    original = reserve_execution_resource("tool", "original-call", context={"task_id": "original-task"})
+    registration.dispose()
+    assert not reserve_execution_resource("tool", "unscoped-call").tracked
+    original.observe("invocation_exited", thread_ident=threading.get_ident())
+    assert observed == ["reserve", "invocation_exited"]

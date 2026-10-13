@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import copy
 import json
 from pathlib import Path
 import logging
@@ -543,6 +544,11 @@ def _registered_tool_worker(agent):
             agent._tool_worker_threads.discard(tid)
         with contextlib.suppress(Exception):
             _ra()._set_interrupt(False, tid)
+        from hermes_cli.plugins_dispatch import current_execution_lifecycle
+        lifecycle = current_execution_lifecycle()
+        if lifecycle is not None:
+            # The work item left; its pool thread can still be alive.
+            lifecycle.observe("invocation_exited", thread_ident=tid)
 
 
 _NO_REASON = object()
@@ -587,14 +593,26 @@ def _run_tool_activity_heartbeat(
 def _run_with_activity_heartbeat(agent, function_name: str, fn):
     """Run ``fn()`` under the activity heartbeat; covers both executor paths."""
     stop = threading.Event()
+    from contextvars import copy_context
+    from uuid import uuid4
+    from hermes_cli.plugins_dispatch import reserve_execution_resource
+    lifecycle = reserve_execution_resource("heartbeat", uuid4().hex)
+    callback_context = copy_context()
+
+    def beat():
+        try:
+            _run_tool_activity_heartbeat(agent, stop, f"tool running: {function_name}",
+                                         interval=_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S)
+        finally:
+            lifecycle.observe("worker_finally", thread_ident=threading.get_ident())
+
     thread = threading.Thread(
         # Keep the gateway turn-inactivity watchdog from abandoning a turn whose tool call runs silently for
         # longer than the inactivity timeout (#84491): stamp activity periodically while the tool is in
         # flight, not just at start/completion. Both the sequential and the concurrent paths funnel through
         # here, so a single heartbeat covers every tool.
-        target=_run_tool_activity_heartbeat,
-        args=(agent, stop, f"tool running: {function_name}"),
-        kwargs={"interval": _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S},
+        target=callback_context.run,
+        args=(beat,),
         daemon=True,
         name=f"tool-activity-hb-{function_name[:24]}",
     )
@@ -604,6 +622,27 @@ def _run_with_activity_heartbeat(agent, function_name: str, fn):
     finally:
         stop.set()
         thread.join(timeout=2.0)
+        if not thread.is_alive():
+            lifecycle.observe("joined", thread_ident=thread.ident)
+
+
+def _reserve_tool_lifecycle(agent, ref):
+    from hermes_cli.plugins_dispatch import reserve_execution_resource
+
+    return reserve_execution_resource("tool", ref.call_id, context={
+        **tool_hook_ids(agent, ref.task_id, ref.call_id), "tool_name": ref.name,
+        "original_args": copy.deepcopy(ref.args),
+    })
+
+
+def _remember_tool_pool(agent, executor):
+    # Keep the actual original executor until bounded finalizer reconciliation.
+    # Durable membership and cancellation facts remain with the plugin owner.
+    pools = getattr(agent, "_tool_lifecycle_pools", None)
+    if pools is None:
+        pools = agent._tool_lifecycle_pools = []
+    if not any(pool is executor for pool in pools):
+        pools.append(executor)
 
 
 def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_message: Optional[str], block_error_type: str, guardrail_decision) -> str:
@@ -838,8 +877,14 @@ def _run_sequential_tool_execution_middleware(
     timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_sequential_tool_timeout()
     ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, middleware_trace)
     kwargs = dict(ref.middleware_kwargs(), execute=execute, scope_block=scope_block, display_index=display_index)
+    from hermes_cli.plugins_dispatch import execution_lifecycle_scope
+    lifecycle = _reserve_tool_lifecycle(agent, ref)
     if function_name in _NEVER_PARALLEL_TOOLS:
-        return _run_agent_tool_execution_middleware(agent, **kwargs)
+        with execution_lifecycle_scope(lifecycle):
+            try:
+                return _run_agent_tool_execution_middleware(agent, **kwargs)
+            finally:
+                lifecycle.observe("invocation_exited", thread_ident=threading.get_ident())
 
     from tools.daemon_pool import DaemonThreadPoolExecutor
 
@@ -854,7 +899,14 @@ def _run_sequential_tool_execution_middleware(
     if ref.trace is None:
         ref.trace = []
     executor = DaemonThreadPoolExecutor(max_workers=1)
-    future = executor.submit(propagate_context_to_thread(_run))
+    if lifecycle.tracked:
+        _remember_tool_pool(agent, executor)
+    try:
+        with execution_lifecycle_scope(lifecycle):
+            future = executor.submit(propagate_context_to_thread(_run))
+    except BaseException:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
     deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     started = time.monotonic()
     abandoned = False
@@ -1165,6 +1217,7 @@ class _ConcurrentBatch:
         self.gate = _StartOrderGate(_start_order_gate_timeout(timeout_s))
         self.authorization_gate = _ConcurrentToolAuthorizationGate()
         self.timed_out_indices: set[int] = set()
+        self.execution_handles = {}
 
     def _dispatch_worker(self, index: int, ref: _ToolCallRef, scope_block, start_gate: _WorkerStartOnce) -> Optional[_ToolOutcome]:
         """Run one call through the middleware and synthesize its slot outcome; ``None`` when
@@ -1242,7 +1295,13 @@ class _ConcurrentBatch:
         future_to_index = {}
         for submit_index, i in enumerate(runnable):
             try:
-                f = executor.submit(propagate_context_to_thread(self.run_worker), i, submit_index)
+                from hermes_cli.plugins_dispatch import execution_lifecycle_scope
+                lifecycle = _reserve_tool_lifecycle(self.agent, self.parsed_calls[i].ref(self.effective_task_id))
+                self.execution_handles[i] = lifecycle
+                if lifecycle.tracked:
+                    _remember_tool_pool(self.agent, executor)
+                with execution_lifecycle_scope(lifecycle):
+                    f = executor.submit(propagate_context_to_thread(self.run_worker), i, submit_index)
             except RuntimeError as submit_error:
                 if not _is_interpreter_shutdown_submit_error(submit_error):
                     raise

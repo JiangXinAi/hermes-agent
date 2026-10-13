@@ -200,3 +200,25 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
             env.cleanup()
         except Exception:
             pass
+
+
+def test_foreground_launch_denied_before_real_child_effect(tmp_path, monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+    from hermes_cli.plugins_dispatch import ExecutionLifecycleError, reserve_execution_resource, execution_lifecycle_scope
+    manager = PluginManager()
+    def callback(*, event):
+        if event["phase"] == "reserve" and event["resource_kind"] == "process":
+            raise ValueError("original local launch denied")
+        return {"admitted": True, "ticket": object()}
+    PluginContext(PluginManifest(name="bounded-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    original = reserve_execution_resource("tool", "original-call", context={})
+    env = LocalEnvironment(cwd=str(tmp_path))
+    produced = tmp_path / "must-not-exist"
+    try:
+        with execution_lifecycle_scope(original), pytest.raises(ExecutionLifecycleError):
+            env._run_bash("touch " + str(produced))
+        assert not produced.exists()
+    finally:
+        env.cleanup()

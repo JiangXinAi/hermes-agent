@@ -7,6 +7,7 @@ the origin (tests patch it there) and is looked up lazily.
 from __future__ import annotations
 
 import contextvars
+from contextlib import contextmanager
 import copy
 import inspect
 import logging
@@ -15,6 +16,7 @@ import re
 import threading
 import time
 import types
+from types import MappingProxyType
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
 
@@ -138,6 +140,117 @@ class _QueuedPluginEvent:
 _HOOK_CALLBACK_TIMEOUT_SECS = 30.0
 _MAX_HOOK_CALLBACK_TIMEOUT_SECS = 600.0
 _HOOK_SKIPPED = object()  # returned by _run_hook_callback_bounded on skip/timeout
+
+
+class ExecutionLifecycleError(RuntimeError):
+    """A synchronous lifecycle owner did not acknowledge the original event."""
+
+
+_execution_lifecycle = contextvars.ContextVar("hermes_execution_lifecycle", default=None)
+_EXECUTION_OBSERVATIONS = frozenset({
+    "submitted", "dispatch", "outcome", "worker_started", "worker_finally", "invocation_exited",
+    "joined", "not_started", "launch_observed", "launch_unknown", "adopted", "process_exit",
+})
+
+
+def _execution_callback(callback, event):
+    # This contract has one required event, unlike additive observer kwargs.
+    # It never creates an untracked async/timeout worker to deliver an admission.
+    if inspect.iscoroutinefunction(callback):
+        raise ExecutionLifecycleError("Synchronous execution lifecycle callback required")
+    try:
+        result = callback(event=event)
+    except Exception:
+        raise ExecutionLifecycleError("Original execution lifecycle unavailable") from None
+    if inspect.isawaitable(result):
+        if inspect.iscoroutine(result):
+            result.close()
+        raise ExecutionLifecycleError("Synchronous execution lifecycle callback required")
+    return result
+
+
+@dataclass(eq=False, repr=False)
+class ExecutionLifecycle:
+    """Original callback/ticket references, not an execution grant or ledger."""
+
+    context: Mapping[str, Any]
+    resource_kind: str
+    resource_id: str
+    owners: tuple
+
+    @property
+    def tracked(self):
+        return bool(self.owners)
+
+    def ticket_for(self, callback):
+        return next((ticket for owner, ticket in self.owners if owner is callback), None)
+
+    def observe(self, phase, **facts):
+        if phase not in _EXECUTION_OBSERVATIONS:
+            raise ValueError("Unknown execution lifecycle observation")
+        for callback, ticket in self.owners:
+            result = _execution_callback(callback, MappingProxyType({
+                "phase": phase, "context": self.context,
+                "resource_kind": self.resource_kind, "resource_id": self.resource_id,
+                "ticket": ticket, "facts": MappingProxyType(dict(facts)),
+            }))
+            if not isinstance(result, Mapping) or result.get("recorded") is not True:
+                raise ExecutionLifecycleError("Original lifecycle observation unconfirmed")
+
+
+def current_execution_lifecycle():
+    return _execution_lifecycle.get()
+
+
+@contextmanager
+def execution_lifecycle_scope(handle):
+    token = _execution_lifecycle.set(handle)
+    try:
+        yield handle
+    finally:
+        _execution_lifecycle.reset(token)
+
+
+def reserve_execution_resource(resource_kind, resource_id, *, context=None, parent=None):
+    """Reserve synchronously before the original submit/start/launch."""
+    from hermes_cli.plugins import _delivery_manager
+
+    if parent is None and context is None:
+        parent = current_execution_lifecycle()
+    identity = dict(parent.context if parent is not None else (context or {}))
+    callbacks = tuple(owner for owner, _ in parent.owners) if parent is not None else None
+    manager = _delivery_manager() if callbacks is None else None
+    if callbacks is None:
+        callbacks = manager.iter_hook_callbacks("execution_lifecycle")
+    owners = []
+    for callback in callbacks:
+        result = _execution_callback(callback, MappingProxyType({
+            "phase": "reserve", "context": MappingProxyType(identity),
+            "resource_kind": resource_kind, "resource_id": resource_id,
+            "parent_ticket": parent.ticket_for(callback) if parent is not None else None,
+            "facts": MappingProxyType({}),
+        }))
+        if result is None:  # Explicitly unscoped ordinary Native execution.
+            continue
+        if (not isinstance(result, Mapping) or result.get("admitted") is not True
+                or result.get("ticket") is None):
+            raise ExecutionLifecycleError("Original execution lifecycle admission refused")
+        owners.append((callback, result["ticket"]))
+    return ExecutionLifecycle(MappingProxyType(identity), resource_kind, resource_id, tuple(owners))
+
+
+def fence_execution_resources(context):
+    """Fence new members; this event cannot attest the caller's own turn join."""
+    from hermes_cli.plugins import _delivery_manager
+
+    for callback in _delivery_manager().iter_hook_callbacks("execution_lifecycle"):
+        result = _execution_callback(callback, MappingProxyType({
+            "phase": "fence", "context": MappingProxyType(dict(context)),
+            "resource_kind": "turn", "resource_id": str(context.get("turn_id") or ""),
+            "facts": MappingProxyType({}),
+        }))
+        if result is not None and (not isinstance(result, Mapping) or result.get("recorded") is not True):
+            raise ExecutionLifecycleError("Original execution lifecycle fence unconfirmed")
 
 
 def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:

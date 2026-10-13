@@ -97,3 +97,53 @@ def _repo_root():
     import pathlib
 
     return pathlib.Path(__file__).resolve().parents[2]
+
+
+def test_execution_outcome_does_not_claim_actual_pool_worker_join(monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+    from hermes_cli.plugins_dispatch import reserve_execution_resource, execution_lifecycle_scope
+    manager = PluginManager()
+    events = []
+    def callback(*, event):
+        events.append((event["resource_kind"], event["phase"]))
+        return ({"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True})
+    PluginContext(PluginManifest(name="bounded-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    original = reserve_execution_resource("tool", "original-call", context={"task_id": "original-task"})
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    try:
+        with execution_lifecycle_scope(original):
+            future = pool.submit(lambda: "inert-component-result")
+        assert future.result(5) == "inert-component-result"
+        assert pool.reconcile_execution_lifecycle(0) == 1
+        assert ("pool_worker", "joined") not in events
+        pool.shutdown(wait=True)
+        assert events.index(("pool_worker", "worker_finally")) < events.index(("pool_worker", "joined"))
+        assert ("work_item", "invocation_exited") in events
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_denied_worker_start_cannot_run_queued_original_work_item_later(monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+    from hermes_cli.plugins_dispatch import ExecutionLifecycleError, reserve_execution_resource, execution_lifecycle_scope
+    import pytest
+    manager = PluginManager()
+    calls = []
+    def callback(*, event):
+        if event["phase"] == "reserve" and event["resource_kind"] == "pool_worker":
+            raise ValueError("worker admission denied")
+        return ({"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True})
+    PluginContext(PluginManifest(name="bounded-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    original = reserve_execution_resource("tool", "original-call", context={})
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    try:
+        with execution_lifecycle_scope(original), pytest.raises(ExecutionLifecycleError):
+            pool.submit(lambda: calls.append("denied"))
+        assert pool.submit(lambda: "ordinary-unscoped").result(5) == "ordinary-unscoped"
+        assert calls == []
+    finally:
+        pool.shutdown(wait=True)

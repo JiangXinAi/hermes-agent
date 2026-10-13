@@ -3007,3 +3007,101 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
     text = _format_async(evt)
     assert text.count("SUBAGENT MODEL REJECTED") == 1
     assert "No fallback chain is configured" not in text
+
+
+def test_original_process_reservation_refusal_precedes_popen(registry, tmp_path, monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+    from hermes_cli.plugins_dispatch import ExecutionLifecycleError
+    manager = PluginManager()
+    def refuse(*, event):
+        raise ValueError("original process reservation unavailable")
+    PluginContext(PluginManifest(name="bounded-owner"), manager).register_hook("execution_lifecycle", refuse)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    produced = tmp_path / "must-not-exist"
+    with pytest.raises(ExecutionLifecycleError):
+        registry.spawn_local("touch " + shlex.quote(str(produced)), cwd=str(tmp_path))
+    assert not produced.exists()
+    assert registry._running == {}
+
+
+def test_original_reader_finally_and_join_follow_real_child_exit(registry, tmp_path, monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+    from hermes_cli.plugins_dispatch import reserve_execution_resource, execution_lifecycle_scope
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager, events = PluginManager(), []
+    def callback(*, event):
+        events.append((event["resource_kind"], event["phase"], dict(event["facts"])))
+        return ({"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True})
+    PluginContext(PluginManifest(name="bounded-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    context = {"session_id": "original-session", "task_id": "original-task", "turn_id": "original-turn"}
+    original = reserve_execution_resource("tool", "original-call", context=context)
+    with execution_lifecycle_scope(original):
+        child = registry.spawn_local(shlex.quote(sys.executable) + " -c 'print(42)'", cwd=str(tmp_path))
+    assert child._completion_event.wait(5)
+    assert registry.reconcile_execution_lifecycle(context, 5) == 0
+    phases = [(kind, phase) for kind, phase, facts in events]
+    assert phases.index(("process_reader", "worker_finally")) < phases.index(("process_reader", "joined"))
+    launch = next(facts for kind, phase, facts in events if phase == "launch_observed")
+    exited = next(facts for kind, phase, facts in events if phase == "process_exit")
+    assert exited == {**launch, "exit_code": 0}
+    assert child.exited
+
+
+def test_tracked_pty_unknown_never_replays_command_through_pipe(registry, monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+    from hermes_cli.plugins_dispatch import ExecutionLifecycleError, reserve_execution_resource, execution_lifecycle_scope
+    manager, phases = PluginManager(), []
+    def callback(*, event):
+        phases.append(event["phase"])
+        return ({"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True})
+    PluginContext(PluginManifest(name="bounded-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    original = reserve_execution_resource("tool", "original-call", context={})
+    def unknown(*args, **kwargs):
+        raise RuntimeError("lost original PTY launch acknowledgement")
+    monkeypatch.setattr(registry, "_spawn_local_pty", unknown)
+    def no_replay(*args, **kwargs):
+        raise AssertionError("unknown original command cannot be launched again")
+    monkeypatch.setattr(subprocess, "Popen", no_replay)
+    with execution_lifecycle_scope(original), pytest.raises(ExecutionLifecycleError):
+        registry.spawn_local("inert-command", use_pty=True)
+    assert "launch_unknown" in phases
+    assert registry._running == {}
+
+
+
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+def test_pipe_postlaunch_interruption_reaps_original_child_and_propagates(registry, tmp_path, monkeypatch, error_type):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+    manager, children = PluginManager(), []
+    interruption = error_type("original launch observation interrupted")
+    def callback(*, event):
+        if event["phase"] == "launch_observed":
+            raise interruption
+        return ({"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True})
+    PluginContext(PluginManifest(name="bounded-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    popen = subprocess.Popen
+    def original_popen(*args, **kwargs):
+        child = popen(*args, **kwargs)
+        children.append(child)
+        return child
+    monkeypatch.setattr(subprocess, "Popen", original_popen)
+    command = shlex.quote(sys.executable) + " -c " + shlex.quote("import time; time.sleep(5)")
+    try:
+        with pytest.raises(error_type) as rejected:
+            registry.spawn_local(command, cwd=str(tmp_path), use_pty=False)
+        assert rejected.value is interruption
+        assert len(children) == 1
+        assert children[0].poll() is not None
+        assert registry._running == {}
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
