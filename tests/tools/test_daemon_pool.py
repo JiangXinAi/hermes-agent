@@ -125,6 +125,34 @@ def test_execution_outcome_does_not_claim_actual_pool_worker_join(monkeypatch):
         pool.shutdown(wait=True)
 
 
+def test_child_turn_inherits_its_submitted_work_item(monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+    from hermes_cli.plugins_dispatch import (
+        bind_execution_turn, current_execution_lifecycle, execution_lifecycle_scope,
+        reserve_execution_resource,
+    )
+    manager = PluginManager()
+    parents = []
+    def callback(*, event):
+        if event["phase"] in {"reserve", "bind_turn"}:
+            if event["phase"] == "bind_turn":
+                parents.append(event["parent_ticket"]["kind"])
+            return {"admitted": True, "ticket": {"kind": event["resource_kind"]}}
+        return {"recorded": True}
+    PluginContext(PluginManifest(name="context-wire"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    original = reserve_execution_resource("tool", "delegate", context={})
+    def child():
+        work = current_execution_lifecycle()
+        turn = bind_execution_turn({"session_id": "child", "task_id": "child-task", "turn_id": "child-turn"})
+        return work.resource_kind, work.parent is original, turn.parent is work
+    with DaemonThreadPoolExecutor(max_workers=1) as pool, execution_lifecycle_scope(original):
+        observed = pool.submit(child).result(timeout=5)
+    assert observed == ("work_item", True, True)
+    assert parents == ["work_item"]
+
+
 def test_denied_worker_start_cannot_run_queued_original_work_item_later(monkeypatch):
     from hermes_cli import plugins as plugins_mod
     from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest

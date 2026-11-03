@@ -32,7 +32,7 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
         Unconditional: on 3.14+ ``ctx.run`` re-applies the same context (no-op)."""
         ctx = copy_context()
         from hermes_cli.plugins_dispatch import (
-            current_execution_lifecycle, reserve_execution_resource,
+            current_execution_lifecycle, execution_lifecycle_scope, reserve_execution_resource,
         )
         parent = current_execution_lifecycle()
         lifecycle = (reserve_execution_resource("work_item", uuid4().hex, parent=parent)
@@ -47,11 +47,12 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
                     from hermes_cli.plugins_dispatch import ExecutionLifecycleError
                     raise ExecutionLifecycleError("Original work item was not submitted")
             def run_original():
-                try:
-                    return fn(*call_args, **call_kwargs)
-                finally:
-                    if lifecycle is not None:
-                        lifecycle.observe("invocation_exited", thread_ident=threading.get_ident())
+                with execution_lifecycle_scope(lifecycle if lifecycle is not None else parent):
+                    try:
+                        return fn(*call_args, **call_kwargs)
+                    finally:
+                        if lifecycle is not None:
+                            lifecycle.observe("invocation_exited", thread_ident=threading.get_ident())
             return ctx.run(run_original)
         try:
             future = super().submit(_run_with_context, *args, **kwargs)
