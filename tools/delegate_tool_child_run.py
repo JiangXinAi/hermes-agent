@@ -4,7 +4,6 @@ timeout/failure handling, result-entry assembly and cleanup (``_ChildRun``)."""
 from __future__ import annotations
 
 import logging
-import contextvars
 import json
 import os
 import threading
@@ -730,7 +729,7 @@ class _ChildRun:
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )
 
-        future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
+        future = executor.submit(_run_with_thread_capture)
         try:
             return future.result(timeout=child_timeout), None, False
         except Exception as wait_exc:

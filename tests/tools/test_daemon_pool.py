@@ -153,6 +153,44 @@ def test_child_turn_inherits_its_submitted_work_item(monkeypatch):
     assert parents == ["work_item"]
 
 
+def test_parallel_delegation_preserves_both_submitted_work_item_scopes(monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+    from hermes_cli.plugins_dispatch import (
+        current_execution_lifecycle, execution_lifecycle_scope, reserve_execution_resource,
+    )
+    from tools.delegate_tool_child_run import _ChildRun
+    from tools import delegate_tool_dispatch as dispatch
+    manager = PluginManager()
+    def callback(*, event):
+        return ({"admitted": True, "ticket": object()} if event["phase"] == "reserve"
+            else {"recorded": True})
+    PluginContext(PluginManifest(name="delegation-context-wire"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    monkeypatch.setattr(dispatch, "_report_child_done", lambda *args: None)
+    original = reserve_execution_resource("tool", "delegate", context={})
+    class Child:
+        session_id = 'child-session'
+        def run_conversation(self, **kwargs):
+            scope = current_execution_lifecycle()
+            return {"final_response": "inert protocol result", "completed": True,
+                "scope_chain": [scope.resource_kind, scope.parent.resource_kind, scope.parent.parent.resource_kind]}
+    child = Child()
+    def run_child(index, goal, child):
+        run = _ChildRun(child, None, index, goal, None, None, child_task_id='child-task')
+        result, failure, _ = run.await_child()
+        assert failure is None
+        return {**result, 'task_index': index, 'status': 'completed'}
+    batch = SimpleNamespace(parent_agent=None, task_list=[{'goal': 'context probe'}],
+        children=[(0, 'context probe', child)], max_children=1, live_deleg_id=None,
+        unit_id=None, run_child=run_child)
+    results = []
+    with execution_lifecycle_scope(original):
+        dispatch._run_children_parallel(batch, results, honor_parent_interrupt=True)
+    assert results[0]['scope_chain'] == ['work_item', 'work_item', 'tool']
+
+
 def test_denied_worker_start_cannot_run_queued_original_work_item_later(monkeypatch):
     from hermes_cli import plugins as plugins_mod
     from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
