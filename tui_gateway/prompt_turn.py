@@ -810,7 +810,7 @@ def _run_prompt_submit(
     )
     from uuid import uuid4
     try:
-        initial = initial_execution_scope(sid, session)
+        initial = initial_execution_scope(sid, session, fresh=True)
         handle = reserve_execution_resource("conversation_worker", uuid4().hex, parent=initial)
     except BaseException:
         with session["history_lock"]:

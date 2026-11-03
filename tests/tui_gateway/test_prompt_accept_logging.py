@@ -85,6 +85,36 @@ def test_original_conversation_worker_finally_includes_post_turn_followups(turn_
     assert phases.index(("worker_finally", "conversation_worker")) < phases.index(("joined", "conversation_worker"))
 
 
+def test_post_turn_followup_owns_a_distinct_initial_scope(turn_env, monkeypatch, tmp_path):
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from hermes_cli.plugins_dispatch import current_initial_execution_scope
+
+    manager = PluginManager()
+    def callback(*, event):
+        return {"admitted": True, "ticket": object()} if event["phase"] == "reserve" else {"recorded": True}
+    PluginContext(PluginManifest(name="component-owner"), manager).register_hook("execution_lifecycle", callback)
+    monkeypatch.setattr(plugins_mod, "_delivery_manager", lambda: manager)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_active_goal_manager", lambda session: None)
+    monkeypatch.setattr(server, "_session_info", lambda agent, session: {})
+    scopes = []
+    session = _session(agent=types.SimpleNamespace(session_id="inert-stored",
+        run_conversation=lambda *args, **kwargs: {"final_response": "inert result"},
+        clear_interrupt=lambda: None), cwd=str(tmp_path), explicit_cwd=True)
+
+    def followups(*args):
+        scopes.append(current_initial_execution_scope())
+        if len(scopes) == 1:
+            assert server._run_prompt_submit("followup", "inert-runtime", session, "inert followup")
+    monkeypatch.setattr(server, "_run_post_turn_followups", followups)
+    assert server._run_prompt_submit("first", "inert-runtime", session, "inert input")
+    assert len(scopes) == 2
+    assert scopes[0] is not scopes[1]
+    assert scopes[0].resource_id != scopes[1].resource_id
+    assert scopes[0].context == scopes[1].context
+
+
 class _InlineThread:
     """Run the turn synchronously so tests observe its final state."""
 
