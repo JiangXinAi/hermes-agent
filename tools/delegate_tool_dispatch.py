@@ -5,7 +5,6 @@ review does not wait for the slowest sibling."""
 
 from __future__ import annotations
 
-import contextvars
 import json
 import logging
 import time
@@ -127,7 +126,7 @@ def _run_children_parallel(batch: _Batch, results: list, *, honor_parent_interru
             return _fabricated_entry(idx, "error", str(exc), _child_by_index.get(idx))
 
     with DaemonThreadPoolExecutor(max_workers=batch.max_children) as executor:
-        futures = {executor.submit(contextvars.copy_context().run, batch.run_child, i, t, child): i for i, t, child in batch.children}
+        futures = {executor.submit(batch.run_child, i, t, child): i for i, t, child in batch.children}
         pending = set(futures)
         while pending:
             if honor_parent_interrupt and getattr(parent_agent, "_interrupt_requested", False) is True:
